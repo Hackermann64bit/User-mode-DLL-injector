@@ -1,4 +1,4 @@
-# Win32 DLL Injector I might expand it in the future.
+# Win32-64 DLL Injector I might expand it in the future.
 
 A stable user‑mode DLL injector for Windows, designed for offline and unprotected applications.
 
@@ -76,4 +76,4 @@ The author does not condone misuse, cheating in online games, or attempts to byp
 Use at your own risk.
 
 ---
-
+If you find any issues, let me know and I might fix them.
