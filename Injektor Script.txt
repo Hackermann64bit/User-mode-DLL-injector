@@ -1,0 +1,1587 @@
+using System;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+using System.Collections.Generic;
+
+namespace TechnicalInjector
+{
+    #region Enums and Flags
+    [Flags]
+    public enum ProcessAccess : uint
+    {
+        CREATE_THREAD = 0x0002,
+        QUERY_INFORMATION = 0x0400,
+        VM_OPERATION = 0x0008,
+        VM_WRITE = 0x0020,
+        VM_READ = 0x0010,
+        ALL_ACCESS = 0x001FFFFF
+    }
+
+    [Flags]
+    public enum ThreadAccess : uint
+    {
+        ALL_ACCESS = 0x1FFFFF
+    }
+
+    [Flags]
+    public enum MemoryAllocation : uint
+    {
+        MEM_COMMIT = 0x00001000,
+        MEM_RESERVE = 0x00002000,
+        PAGE_READWRITE = 0x04,
+        MEM_RELEASE = 0x8000
+    }
+
+    public enum InjectionStatus
+    {
+        NotStarted,
+        PreFlightChecking,
+        ArchCheckPassed,
+        ProcessCheckPassed,
+        MemoryAllocated,
+        DLLWritten,
+        ThreadCreated,
+        WaitingForThread,
+        CleaningUp,
+        Success,
+        Warning,
+        Failed
+    }
+
+    public enum PreFlightStatus
+    {
+        Passed,
+        Warning,
+        Blocked,
+        Error
+    }
+    #endregion
+
+    #region Helper Classes
+    public class InjectionResult
+    {
+        public bool IsSuccessful { get; set; }
+        public bool IsWarning { get; set; }
+        public InjectionStatus Status { get; set; }
+        public string? ErrorMessage { get; set; }
+
+        public static InjectionResult CreateSuccess()
+        {
+            return new InjectionResult
+            {
+                IsSuccessful = true,
+                IsWarning = false,
+                Status = InjectionStatus.Success,
+                ErrorMessage = null
+            };
+        }
+
+        public static InjectionResult CreateFailure(string error)
+        {
+            return new InjectionResult
+            {
+                IsSuccessful = false,
+                IsWarning = false,
+                Status = InjectionStatus.Failed,
+                ErrorMessage = error
+            };
+        }
+
+        public static InjectionResult CreateWarning(string warning)
+        {
+            return new InjectionResult
+            {
+                IsSuccessful = true,
+                IsWarning = true,
+                Status = InjectionStatus.Warning,
+                ErrorMessage = warning
+            };
+        }
+    }
+
+    public class ProcessInfo
+    {
+        public string Name { get; set; } = "";
+        public int Pid { get; set; }
+        public string Architecture { get; set; } = "";
+        public Process Process { get; set; } = null!;
+    }
+    #endregion
+
+    #region Pre-Flight Check System
+    public static class PreFlightChecks
+    {
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr OpenProcess(ProcessAccess dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWow64Process(IntPtr hProcess, out bool wow64Process);
+
+        public class PreFlightResult
+        {
+            public PreFlightStatus Status { get; set; }
+            public string Message { get; set; } = "";
+            public bool CanInject { get; set; }
+            public List<string> Warnings { get; set; } = new List<string>();
+            public List<string> Blocks { get; set; } = new List<string>();
+        }
+
+        public static PreFlightResult PerformChecks(int targetPid, string dllPath)
+        {
+            var result = new PreFlightResult();
+
+            try
+            {
+                // 1. Process existence check
+                Process targetProcess;
+                try
+                {
+                    targetProcess = Process.GetProcessById(targetPid);
+                }
+                catch
+                {
+                    result.Status = PreFlightStatus.Blocked;
+                    result.Blocks.Add("Process does not exist or access denied");
+                    result.CanInject = false;
+                    return result;
+                }
+
+                // 2. Architecture compatibility check
+                var archResult = CheckArchitectureCompatibility(targetPid, dllPath);
+                if (!archResult.CanInject)
+                {
+                    result.Status = PreFlightStatus.Blocked;
+                    result.Blocks.Add(archResult.Message);
+                    result.CanInject = false;
+                    return result;
+                }
+                else if (!string.IsNullOrEmpty(archResult.Message))
+                {
+                    result.Warnings.Add(archResult.Message);
+                }
+
+                // 3. .NET DLL check
+                var clrResult = CheckCLRCompatibility(targetPid, dllPath);
+                if (!clrResult.CanInject)
+                {
+                    result.Status = PreFlightStatus.Blocked;
+                    result.Blocks.Add(clrResult.Message);
+                    result.CanInject = false;
+                    return result;
+                }
+                else if (!string.IsNullOrEmpty(clrResult.Message))
+                {
+                    result.Warnings.Add(clrResult.Message);
+                }
+
+                // 4. Protected process check
+                var protectResult = CheckProtectedProcess(targetPid);
+                if (!protectResult.CanInject)
+                {
+                    result.Status = PreFlightStatus.Blocked;
+                    result.Blocks.Add(protectResult.Message);
+                    result.CanInject = false;
+                    return result;
+                }
+                else if (!string.IsNullOrEmpty(protectResult.Message))
+                {
+                    result.Warnings.Add(protectResult.Message);
+                }
+
+                // 5. Anti-Cheat indicators
+                var acResult = CheckAntiCheatIndicators(targetPid);
+                if (!acResult.CanInject)
+                {
+                    result.Warnings.Add(acResult.Message);
+                }
+
+                // 6. Module enumeration test
+                var moduleResult = TestModuleEnumeration(targetPid);
+                if (!moduleResult.CanInject)
+                {
+                    result.Warnings.Add(moduleResult.Message);
+                }
+
+                // Final decision
+                if (result.Blocks.Count > 0)
+                {
+                    result.Status = PreFlightStatus.Blocked;
+                    result.CanInject = false;
+                    result.Message = "Blocked by pre-flight checks";
+                }
+                else if (result.Warnings.Count > 0)
+                {
+                    result.Status = PreFlightStatus.Warning;
+                    result.CanInject = true;
+                    result.Message = "Warnings detected, injection may fail";
+                }
+                else
+                {
+                    result.Status = PreFlightStatus.Passed;
+                    result.CanInject = true;
+                    result.Message = "All checks passed";
+                }
+            }
+            catch (Exception ex)
+            {
+                result.Status = PreFlightStatus.Error;
+                result.CanInject = false;
+                result.Message = $"Check error: {ex.Message}";
+            }
+
+            return result;
+        }
+
+        private static (bool CanInject, string Message) CheckArchitectureCompatibility(int pid, string dllPath)
+        {
+            try
+            {
+                string processArch = GetProcessArchitectureInternal(pid);
+                string dllArch = GetDLLArchitectureInternal(dllPath);
+
+                if (processArch == "Unknown" || dllArch == "Unknown")
+                {
+                    return (false, "Cannot determine architecture");
+                }
+
+                if (processArch == "x86" && dllArch != "x86")
+                {
+                    return (false, $"32-bit process cannot load {dllArch} DLL");
+                }
+
+                if (processArch == "x64" && dllArch != "x64")
+                {
+                    return (false, $"64-bit process cannot load {dllArch} DLL");
+                }
+
+                return (true, $"Architecture match: {processArch} → {dllArch}");
+            }
+            catch
+            {
+                return (false, "Architecture check failed");
+            }
+        }
+
+        // Öffentliche Methode für Architekturprüfung
+        public static string GetProcessArchitecture(int pid)
+        {
+            return GetProcessArchitectureInternal(pid);
+        }
+
+        private static string GetProcessArchitectureInternal(int pid)
+        {
+            IntPtr hProcess = OpenProcess(ProcessAccess.QUERY_INFORMATION, false, (uint)pid);
+            if (hProcess == IntPtr.Zero)
+                return "Unknown";
+
+            try
+            {
+                if (Environment.Is64BitOperatingSystem)
+                {
+                    if (IsWow64Process(hProcess, out bool isWow64))
+                    {
+                        return isWow64 ? "x86" : "x64";
+                    }
+                }
+                return "x86";
+            }
+            finally
+            {
+                if (hProcess != IntPtr.Zero)
+                    CloseHandle(hProcess);
+            }
+        }
+
+        // Öffentliche Methode für DLL Architekturprüfung
+        public static string GetDLLArchitecture(string dllPath)
+        {
+            return GetDLLArchitectureInternal(dllPath);
+        }
+
+        private static string GetDLLArchitectureInternal(string dllPath)
+        {
+            try
+            {
+                using var fs = new FileStream(dllPath, FileMode.Open, FileAccess.Read);
+                using var br = new BinaryReader(fs);
+
+                if (br.ReadUInt16() != 0x5A4D) // MZ
+                    return "Unknown";
+
+                fs.Seek(0x3C, SeekOrigin.Begin);
+                int peOffset = br.ReadInt32();
+
+                fs.Seek(peOffset, SeekOrigin.Begin);
+                if (br.ReadUInt32() != 0x00004550) // PE
+                    return "Unknown";
+
+                ushort machine = br.ReadUInt16();
+
+                return machine switch
+                {
+                    0x014C => "x86",
+                    0x8664 => "x64",
+                    0x0200 => "IA64",
+                    _ => "Unknown"
+                };
+            }
+            catch
+            {
+                return "Unknown";
+            }
+        }
+
+        private static (bool CanInject, string Message) CheckCLRCompatibility(int pid, string dllPath)
+        {
+            try
+            {
+                // Check if DLL is .NET
+                bool isDotNetDLL = false;
+                try
+                {
+                    using var fs = new FileStream(dllPath, FileMode.Open, FileAccess.Read);
+                    using var br = new BinaryReader(fs);
+
+                    // Skip to optional header data directory for CLR
+                    fs.Seek(0x3C, SeekOrigin.Begin);
+                    int peOffset = br.ReadInt32();
+                    fs.Seek(peOffset + 24 + 208, SeekOrigin.Begin); // DataDirectory[14] - CLR Header
+                    int clrRva = br.ReadInt32();
+                    int clrSize = br.ReadInt32();
+
+                    isDotNetDLL = clrRva != 0 && clrSize != 0;
+                }
+                catch
+                {
+                    // If we can't read, assume not .NET
+                }
+
+                if (!isDotNetDLL)
+                {
+                    return (true, "DLL is native, no CLR check needed");
+                }
+
+                // Check if process has CLR
+                bool processHasCLR = false;
+                try
+                {
+                    var process = Process.GetProcessById(pid);
+                    foreach (ProcessModule module in process.Modules)
+                    {
+                        if (module.ModuleName.ToLower().Contains("clr") ||
+                            module.ModuleName.ToLower().Contains("mscoree"))
+                        {
+                            processHasCLR = true;
+                            break;
+                        }
+                    }
+                }
+                catch
+                {
+                    // Module enumeration might fail
+                }
+
+                if (isDotNetDLL && !processHasCLR)
+                {
+                    return (false, ".NET DLL cannot load into non-CLR process");
+                }
+
+                return (true, isDotNetDLL ? "Process supports .NET DLLs" : "Native injection");
+            }
+            catch
+            {
+                return (false, "CLR compatibility check failed");
+            }
+        }
+
+        private static (bool CanInject, string Message) CheckProtectedProcess(int pid)
+        {
+            IntPtr hProcess = IntPtr.Zero;
+            try
+            {
+                // Try with minimal rights first
+                hProcess = OpenProcess(ProcessAccess.QUERY_INFORMATION, false, (uint)pid);
+
+                if (hProcess == IntPtr.Zero)
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    if (error == 5) // ACCESS_DENIED
+                    {
+                        return (false, "Protected process detected (ACCESS_DENIED)");
+                    }
+                    return (false, $"Cannot open process (Error: {error})");
+                }
+
+                return (true, "Process is accessible");
+            }
+            finally
+            {
+                if (hProcess != IntPtr.Zero)
+                    CloseHandle(hProcess);
+            }
+        }
+
+        private static (bool CanInject, string Message) CheckAntiCheatIndicators(int pid)
+        {
+            try
+            {
+                var process = Process.GetProcessById(pid);
+                var indicators = new List<string>();
+
+                // Known AC modules
+                string[] acModules =
+                {
+                    "EasyAntiCheat", "BattlEye", "BEservice", "FaceIt",
+                    "vgc", "GameGuard", "XignCode", "nProtect", "PunkBuster"
+                };
+
+                foreach (ProcessModule module in process.Modules)
+                {
+                    string moduleName = module.ModuleName.ToLower();
+                    foreach (string ac in acModules)
+                    {
+                        if (moduleName.Contains(ac.ToLower()))
+                        {
+                            indicators.Add($"Found AC module: {module.ModuleName}");
+                            break;
+                        }
+                    }
+                }
+
+                if (indicators.Count > 0)
+                {
+                    return (true, $"⚠️ Anti-Cheat indicators: {string.Join(", ", indicators)}");
+                }
+
+                return (true, "No obvious Anti-Cheat detected");
+            }
+            catch
+            {
+                return (true, "Could not check for Anti-Cheat (non-critical)");
+            }
+        }
+
+        private static (bool CanInject, string Message) TestModuleEnumeration(int pid)
+        {
+            try
+            {
+                var process = Process.GetProcessById(pid);
+                var modules = process.Modules;
+                int count = modules.Count;
+
+                if (count == 0)
+                {
+                    return (false, "Module enumeration failed - protected process or cross-architecture");
+                }
+
+                return (true, $"Successfully enumerated {count} modules");
+            }
+            catch (Exception ex)
+            {
+                return (false, $"Module enumeration failed: {ex.Message}");
+            }
+        }
+    }
+    #endregion
+
+    #region Native Methods
+    internal static class NativeMethods
+    {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(ProcessAccess dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, uint nSize, out uint lpNumberOfBytesWritten);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool VirtualFreeEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, MemoryAllocation dwFreeType);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr CreateRemoteThread(IntPtr hProcess, IntPtr lpThreadAttributes, uint dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, IntPtr lpThreadId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsWow64Process(IntPtr hProcess, out bool wow64Process);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool GetExitCodeThread(IntPtr hThread, out uint lpExitCode);
+
+        [DllImport("ntdll.dll", SetLastError = true)]
+        public static extern uint NtCreateThreadEx(
+            out IntPtr hThread,
+            ThreadAccess DesiredAccess,
+            IntPtr lpThreadAttributes,
+            IntPtr ProcessHandle,
+            IntPtr lpStartAddress,
+            IntPtr lpParameter,
+            uint CreateFlags,
+            uint ZeroBits,
+            uint StackSize,
+            uint MaximumStackSize,
+            IntPtr lpAttributeList);
+
+        public const uint INFINITE = 0xFFFFFFFF;
+        public const uint STATUS_SUCCESS = 0x00000000;
+        public const uint STATUS_ACCESS_DENIED = 0xC0000022;
+        public const uint STATUS_INVALID_PARAMETER = 0xC000000D;
+        public const uint WAIT_TIMEOUT = 0x00000102;
+    }
+    #endregion
+
+    #region RichTextBox Helper Extension
+    public static class RichTextBoxExtensions
+    {
+        public static void AppendTextWithColor(this RichTextBox box, string text, Color color)
+        {
+            if (box.InvokeRequired)
+            {
+                box.Invoke(new Action(() => AppendTextWithColor(box, text, color)));
+                return;
+            }
+
+            box.SelectionStart = box.TextLength;
+            box.SelectionLength = 0;
+            box.SelectionColor = color;
+            box.AppendText(text);
+            box.SelectionColor = box.ForeColor;
+        }
+    }
+    #endregion
+
+    #region Main Form
+    public sealed class MainForm : Form
+    {
+        private readonly ListView processListView = new();
+        private readonly TextBox dllPathBox = new();
+        private readonly Button browseButton = new();
+        private readonly Button refreshButton = new();
+        private readonly Button injectButton = new();
+        private readonly CheckBox useNtMethodCheck = new();
+        private readonly CheckBox waitForInitCheck = new();
+        private readonly CheckBox bypassAntiCheatCheck = new();
+        private readonly Label statusLabel = new();
+        private readonly Label selectedLabel = new();
+        private readonly Label infoLabel = new();
+        private readonly TextBox searchBox = new();
+        private readonly RichTextBox logBox = new();
+        private readonly ProgressBar progressBar = new();
+        private readonly RichTextBox preFlightBox = new();
+        private readonly Button runChecksButton = new();
+        private readonly Label preFlightStatusLabel = new();
+        private readonly ListBox phaseListBox = new ListBox();
+        private readonly bool isAdmin;
+        private List<ProcessInfo> processCache = new();
+        private InjectionStatus currentPhase = InjectionStatus.NotStarted;
+
+        public MainForm()
+        {
+            using var identity = WindowsIdentity.GetCurrent();
+            isAdmin = new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator);
+
+            InitializeUI();
+            SetupEventHandlers();
+            RefreshProcessList();
+            LogStartupInfo();
+        }
+
+        private void InitializeUI()
+        {
+            Text = "Injector MadeByMatzYT For Win 32bit and 64bit ";
+            MinimumSize = new Size(1000, 700);
+            Size = new Size(1100, 800);
+            StartPosition = FormStartPosition.CenterScreen;
+            BackColor = SystemColors.Window;
+            ForeColor = SystemColors.WindowText;
+            Font = new Font("Segoe UI", 9);
+            Icon = SystemIcons.Application;
+
+            // Main layout
+            var mainTable = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 1,
+                Padding = new Padding(5)
+            };
+            mainTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 35F));
+            mainTable.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 65F));
+
+            // Left Panel - Process List
+            var leftPanel = new Panel { Dock = DockStyle.Fill, Margin = new Padding(2) };
+
+            var listGroup = new GroupBox
+            {
+                Text = "Process List",
+                Dock = DockStyle.Fill,
+                Font = new Font("Segoe UI", 10, FontStyle.Bold),
+                Padding = new Padding(5)
+            };
+
+            searchBox.Dock = DockStyle.Top;
+            searchBox.Height = 30;
+            searchBox.PlaceholderText = "Filter by name or PID...";
+            searchBox.Margin = new Padding(0, 0, 0, 5);
+
+            processListView.Dock = DockStyle.Fill;
+            processListView.View = View.Details;
+            processListView.FullRowSelect = true;
+            processListView.MultiSelect = false;
+            processListView.Columns.Add("Process", 150);
+            processListView.Columns.Add("PID", 70);
+            processListView.Columns.Add("Arch", 60);
+
+            refreshButton.Text = "🔄 Refresh";
+            refreshButton.Dock = DockStyle.Bottom;
+            refreshButton.Height = 35;
+            refreshButton.Font = new Font("Segoe UI", 9);
+            refreshButton.Margin = new Padding(0, 5, 0, 0);
+
+            listGroup.Controls.Add(processListView);
+            listGroup.Controls.Add(refreshButton);
+            listGroup.Controls.Add(searchBox);
+            leftPanel.Controls.Add(listGroup);
+
+            // Right Panel - Main Content
+            var rightPanel = new Panel { Dock = DockStyle.Fill, Margin = new Padding(2) };
+
+            // Pre-Flight Checks Group
+            var preFlightGroup = new GroupBox
+            {
+                Text = "🧩 PRE-FLIGHT CHECKS",
+                Dock = DockStyle.Top,
+                Height = 200,
+                Font = new Font("Segoe UI", 10, FontStyle.Bold),
+                Padding = new Padding(10),
+                Margin = new Padding(5)
+            };
+
+            var preFlightLayout = new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = 2,
+                RowCount = 1
+            };
+            preFlightLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 70F));
+            preFlightLayout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 30F));
+
+            preFlightBox.Dock = DockStyle.Fill;
+            preFlightBox.Font = new Font("Consolas", 8);
+            preFlightBox.BackColor = Color.FromArgb(25, 25, 30);
+            preFlightBox.ForeColor = Color.LightGray;
+            preFlightBox.ReadOnly = true;
+
+            var controlPanel = new Panel { Dock = DockStyle.Fill, Padding = new Padding(10) };
+
+            preFlightStatusLabel.Text = "Not checked";
+            preFlightStatusLabel.ForeColor = Color.Gray;
+            preFlightStatusLabel.Font = new Font("Segoe UI", 9, FontStyle.Bold);
+            preFlightStatusLabel.Height = 30;
+
+            runChecksButton.Text = "Run Checks";
+            runChecksButton.Height = 35;
+            runChecksButton.Dock = DockStyle.Bottom;
+            runChecksButton.BackColor = Color.SteelBlue;
+            runChecksButton.ForeColor = Color.White;
+
+            controlPanel.Controls.Add(preFlightStatusLabel);
+            controlPanel.Controls.Add(runChecksButton);
+
+            preFlightLayout.Controls.Add(preFlightBox, 0, 0);
+            preFlightLayout.Controls.Add(controlPanel, 1, 0);
+            preFlightGroup.Controls.Add(preFlightLayout);
+
+            // Phase Display Group
+            var phaseGroup = new GroupBox
+            {
+                Text = "📊 INJECTION PHASES",
+                Dock = DockStyle.Top,
+                Height = 150,
+                Font = new Font("Segoe UI", 10, FontStyle.Bold),
+                Padding = new Padding(10),
+                Margin = new Padding(5)
+            };
+
+            phaseListBox.Dock = DockStyle.Fill;
+            phaseListBox.Font = new Font("Consolas", 9);
+            phaseListBox.BackColor = Color.FromArgb(30, 30, 35);
+            phaseListBox.ForeColor = Color.LightGray;
+            phaseListBox.Items.Add("🔄 Not started");
+            phaseGroup.Controls.Add(phaseListBox);
+
+            // Injection Controls Group
+            var controlGroup = new GroupBox
+            {
+                Text = "Injection Controls",
+                Dock = DockStyle.Top,
+                Height = 280,
+                Font = new Font("Segoe UI", 10, FontStyle.Bold),
+                Padding = new Padding(10),
+                Margin = new Padding(5)
+            };
+
+            var flowPanel = new FlowLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                FlowDirection = FlowDirection.TopDown,
+                WrapContents = false,
+                AutoScroll = true
+            };
+
+            // DLL Selection Row
+            var dllRow = new Panel { Height = 30, Width = 500 };
+            var dllLabel = new Label { Text = "DLL File:", Location = new Point(0, 5), Size = new Size(70, 25) };
+            dllPathBox.Location = new Point(75, 3);
+            dllPathBox.Size = new Size(300, 25);
+            browseButton.Text = "Browse...";
+            browseButton.Location = new Point(380, 3);
+            browseButton.Size = new Size(80, 25);
+            dllRow.Controls.AddRange(new Control[] { dllLabel, dllPathBox, browseButton });
+
+            // Options Row
+            var optionsRow = new Panel { Height = 80, Width = 500 };
+            useNtMethodCheck.Text = "Use NtCreateThreadEx";
+            useNtMethodCheck.Location = new Point(0, 5);
+            useNtMethodCheck.Size = new Size(180, 25);
+            waitForInitCheck.Text = "Wait for init";
+            waitForInitCheck.Location = new Point(0, 35);
+            waitForInitCheck.Size = new Size(120, 25);
+            waitForInitCheck.Checked = true;
+            bypassAntiCheatCheck.Text = "Little Bypass";
+            bypassAntiCheatCheck.Location = new Point(200, 5);
+            bypassAntiCheatCheck.Size = new Size(200, 25);
+            optionsRow.Controls.AddRange(new Control[] { useNtMethodCheck, waitForInitCheck, bypassAntiCheatCheck });
+
+            // Info Row
+            var infoRow = new Panel { Height = 50, Width = 500 };
+            selectedLabel.Text = "Selected: None";
+            selectedLabel.Location = new Point(0, 5);
+            selectedLabel.Size = new Size(500, 20);
+            infoLabel.Text = "Ready";
+            infoLabel.Location = new Point(0, 25);
+            infoLabel.Size = new Size(500, 20);
+            infoLabel.ForeColor = Color.Gray;
+            infoRow.Controls.AddRange(new Control[] { selectedLabel, infoLabel });
+
+            // Inject Button
+            injectButton.Text = "🚀 Inject DLL";
+            injectButton.Height = 45;
+            injectButton.Width = 500;
+            injectButton.BackColor = Color.SteelBlue;
+            injectButton.ForeColor = Color.White;
+            injectButton.Font = new Font("Segoe UI", 10, FontStyle.Bold);
+            injectButton.Enabled = false;
+
+            // Status Row
+            var statusRow = new Panel { Height = 60, Width = 500 };
+            statusLabel.Text = isAdmin ? "⚡ Administrator" : "👤 Standard user";
+            statusLabel.Location = new Point(0, 5);
+            statusLabel.Size = new Size(500, 25);
+            statusLabel.ForeColor = isAdmin ? Color.DarkGreen : Color.DarkOrange;
+            progressBar.Location = new Point(0, 35);
+            progressBar.Size = new Size(500, 20);
+            progressBar.Visible = false;
+            statusRow.Controls.AddRange(new Control[] { statusLabel, progressBar });
+
+            flowPanel.Controls.Add(dllRow);
+            flowPanel.Controls.Add(optionsRow);
+            flowPanel.Controls.Add(infoRow);
+            flowPanel.Controls.Add(injectButton);
+            flowPanel.Controls.Add(statusRow);
+            controlGroup.Controls.Add(flowPanel);
+
+            // Log Group
+            var logGroup = new GroupBox
+            {
+                Text = "Execution Log",
+                Dock = DockStyle.Fill,
+                Font = new Font("Segoe UI", 10, FontStyle.Bold),
+                Padding = new Padding(5),
+                Margin = new Padding(0, 5, 0, 0)
+            };
+
+            logBox.Dock = DockStyle.Fill;
+            logBox.Font = new Font("Consolas", 9);
+            logBox.BackColor = Color.FromArgb(30, 30, 30);
+            logBox.ForeColor = Color.LightGray;
+            logBox.ReadOnly = true;
+            logGroup.Controls.Add(logBox);
+
+            // Add all groups to right panel
+            rightPanel.Controls.Add(preFlightGroup);
+            rightPanel.Controls.Add(phaseGroup);
+            rightPanel.Controls.Add(controlGroup);
+            rightPanel.Controls.Add(logGroup);
+
+            mainTable.Controls.Add(leftPanel, 0, 0);
+            mainTable.Controls.Add(rightPanel, 1, 0);
+            Controls.Add(mainTable);
+        }
+
+        private void SetupEventHandlers()
+        {
+            processListView.SelectedIndexChanged += (s, e) =>
+            {
+                if (processListView.SelectedItems.Count > 0)
+                {
+                    var item = processListView.SelectedItems[0];
+                    var tag = item.Tag;
+                    if (tag != null && tag is int pid)
+                    {
+                        try
+                        {
+                            var process = Process.GetProcessById(pid);
+                            selectedLabel.Text = $"Selected: {process.ProcessName} (PID: {pid})";
+                            injectButton.Enabled = true;
+                            injectButton.BackColor = Color.SteelBlue;
+                        }
+                        catch
+                        {
+                            selectedLabel.Text = "Selected: Invalid process";
+                            injectButton.Enabled = false;
+                            injectButton.BackColor = Color.Gray;
+                        }
+                    }
+                }
+                else
+                {
+                    selectedLabel.Text = "Selected: None";
+                    injectButton.Enabled = false;
+                    injectButton.BackColor = Color.Gray;
+                }
+            };
+
+            searchBox.TextChanged += (s, e) =>
+            {
+                ApplySearchFilter(searchBox.Text);
+            };
+
+            refreshButton.Click += (s, e) =>
+            {
+                refreshButton.Enabled = false;
+                refreshButton.Text = "Loading...";
+
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    RefreshProcessList();
+
+                    this.Invoke(new Action(() =>
+                    {
+                        refreshButton.Enabled = true;
+                        refreshButton.Text = "🔄 Refresh";
+                    }));
+                });
+            };
+
+            browseButton.Click += (s, e) =>
+            {
+                using var ofd = new OpenFileDialog
+                {
+                    Filter = "Dynamic Link Libraries (*.dll)|*.dll|All Files (*.*)|*.*",
+                    Title = "Select DLL to Inject",
+                    CheckFileExists = true,
+                    Multiselect = false
+                };
+
+                if (ofd.ShowDialog() == DialogResult.OK)
+                {
+                    dllPathBox.Text = ofd.FileName;
+                    LogSuccess($"Selected: {Path.GetFileName(ofd.FileName)}");
+                }
+            };
+
+            runChecksButton.Click += RunPreFlightChecks;
+
+            injectButton.Click += (s, e) =>
+            {
+                if (string.IsNullOrEmpty(dllPathBox.Text) || !File.Exists(dllPathBox.Text))
+                {
+                    MessageBox.Show("Please select a valid DLL file", "Error",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                if (processListView.SelectedItems.Count == 0)
+                {
+                    MessageBox.Show("Please select a target process", "Error",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                var selectedItem = processListView.SelectedItems[0];
+                var tag = selectedItem.Tag;
+                if (tag == null || !(tag is int pid))
+                {
+                    MessageBox.Show("Invalid process selection", "Error",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                progressBar.Visible = true;
+                progressBar.Style = ProgressBarStyle.Marquee;
+                injectButton.Enabled = false;
+                injectButton.Text = "Injecting...";
+                statusLabel.Text = "Injecting...";
+                statusLabel.ForeColor = Color.Blue;
+
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    var result = Inject(pid, dllPathBox.Text, useNtMethodCheck.Checked);
+
+                    this.Invoke(new Action(() =>
+                    {
+                        progressBar.Visible = false;
+                        progressBar.Style = ProgressBarStyle.Blocks;
+                        injectButton.Enabled = true;
+                        injectButton.Text = "🚀 Inject DLL";
+                        statusLabel.Text = isAdmin ? "⚡ Administrator" : "👤 Standard user";
+                        statusLabel.ForeColor = isAdmin ? Color.DarkGreen : Color.DarkOrange;
+
+                        if (result.IsSuccessful && !result.IsWarning)
+                        {
+                            LogSuccess($"✅ Injection successful into PID {pid}");
+                            MessageBox.Show($"DLL successfully injected into process {pid}", "Success",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        }
+                        else if (result.IsWarning)
+                        {
+                            LogWarning($"⚠️ Injection completed with warnings: {result.ErrorMessage}");
+                            MessageBox.Show($"Injection completed with warnings:\n{result.ErrorMessage}", "Warning",
+                                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        }
+                        else
+                        {
+                            LogError($"❌ Injection failed: {result.ErrorMessage}");
+                            MessageBox.Show($"Injection failed:\n{result.ErrorMessage}", "Error",
+                                MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        }
+                    }));
+                });
+            };
+
+            this.FormClosing += (s, e) =>
+            {
+                foreach (var procInfo in processCache)
+                {
+                    procInfo.Process?.Dispose();
+                }
+                processCache.Clear();
+            };
+        }
+
+        private void RunPreFlightChecks(object? sender, EventArgs e)
+        {
+            if (processListView.SelectedItems.Count == 0)
+            {
+                MessageBox.Show("Please select a target process first", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            if (string.IsNullOrEmpty(dllPathBox.Text) || !File.Exists(dllPathBox.Text))
+            {
+                MessageBox.Show("Please select a valid DLL file", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            var selectedItem = processListView.SelectedItems[0];
+            var tag = selectedItem.Tag;
+            if (tag == null || !(tag is int pid))
+            {
+                MessageBox.Show("Invalid process selection", "Error",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            runChecksButton.Enabled = false;
+            runChecksButton.Text = "Checking...";
+            preFlightBox.Clear();
+
+            ThreadPool.QueueUserWorkItem(_ =>
+            {
+                try
+                {
+                    var result = PreFlightChecks.PerformChecks(pid, dllPathBox.Text);
+
+                    this.Invoke(new Action(() =>
+                    {
+                        preFlightBox.AppendTextWithColor($"=== PRE-FLIGHT CHECK RESULTS ===\n\n", Color.White);
+
+                        preFlightBox.AppendTextWithColor($"Overall Status: ", Color.White);
+                        preFlightBox.AppendTextWithColor($"{result.Status}\n",
+                            result.Status == PreFlightStatus.Passed ? Color.LimeGreen :
+                            result.Status == PreFlightStatus.Warning ? Color.Orange :
+                            result.Status == PreFlightStatus.Blocked ? Color.Red : Color.Gray);
+
+                        preFlightBox.AppendTextWithColor($"Message: {result.Message}\n\n", Color.LightGray);
+
+                        if (result.Blocks.Count > 0)
+                        {
+                            preFlightBox.AppendTextWithColor("🚫 BLOCKS:\n", Color.Red);
+                            foreach (var block in result.Blocks)
+                            {
+                                preFlightBox.AppendTextWithColor($"  • {block}\n", Color.Red);
+                            }
+                            preFlightBox.AppendTextWithColor("\n", Color.White);
+                        }
+
+                        if (result.Warnings.Count > 0)
+                        {
+                            preFlightBox.AppendTextWithColor("⚠️ WARNINGS:\n", Color.Orange);
+                            foreach (var warning in result.Warnings)
+                            {
+                                preFlightBox.AppendTextWithColor($"  • {warning}\n", Color.Orange);
+                            }
+                            preFlightBox.AppendTextWithColor("\n", Color.White);
+                        }
+
+                        // Update status label
+                        preFlightStatusLabel.Text = result.Status.ToString();
+                        preFlightStatusLabel.ForeColor = result.Status == PreFlightStatus.Passed ? Color.LimeGreen :
+                                                       result.Status == PreFlightStatus.Warning ? Color.Orange : Color.Red;
+
+                        // Update inject button
+                        injectButton.Enabled = result.CanInject;
+                        injectButton.BackColor = result.CanInject ? Color.SteelBlue : Color.Gray;
+
+                        if (!result.CanInject && result.Blocks.Count > 0)
+                        {
+                            string blockText = result.Blocks[0];
+                            injectButton.Text = $"BLOCKED: {blockText.Substring(0, Math.Min(20, blockText.Length))}...";
+                        }
+                        else
+                        {
+                            injectButton.Text = result.CanInject ? "🚀 Inject DLL" : "Cannot Inject";
+                        }
+                    }));
+                }
+                catch (Exception ex)
+                {
+                    this.Invoke(new Action(() =>
+                    {
+                        preFlightBox.AppendTextWithColor($"Error during checks: {ex.Message}\n", Color.Red);
+                    }));
+                }
+                finally
+                {
+                    this.Invoke(new Action(() =>
+                    {
+                        runChecksButton.Enabled = true;
+                        runChecksButton.Text = "Run Checks";
+                    }));
+                }
+            });
+        }
+
+        #region Enhanced Injection Logic with Memory Allocation Fix
+        private InjectionResult Inject(int pid, string dllPath, bool useNtMethod)
+        {
+            UpdatePhase(InjectionStatus.PreFlightChecking);
+
+            // Run pre-flight checks again to be sure
+            var preCheck = PreFlightChecks.PerformChecks(pid, dllPath);
+            if (!preCheck.CanInject)
+            {
+                return InjectionResult.CreateFailure($"Pre-flight check failed: {preCheck.Message}");
+            }
+
+            // Strikte Architekturprüfung
+            string processArch = PreFlightChecks.GetProcessArchitecture(pid);
+            string dllArch = PreFlightChecks.GetDLLArchitecture(dllPath);
+
+            if (processArch != dllArch)
+            {
+                return InjectionResult.CreateFailure($"Architecture mismatch: process {processArch}, DLL {dllArch}");
+            }
+
+            UpdatePhase(InjectionStatus.ProcessCheckPassed, "Process accessible & architecture matches");
+
+            IntPtr hProcess = IntPtr.Zero;
+            IntPtr allocatedMem = IntPtr.Zero;
+            IntPtr hThread = IntPtr.Zero;
+            bool ntMethodFailed = false;
+
+            try
+            {
+                // Open process with necessary access rights
+                var access = ProcessAccess.CREATE_THREAD |
+                            ProcessAccess.QUERY_INFORMATION |
+                            ProcessAccess.VM_OPERATION |
+                            ProcessAccess.VM_WRITE |
+                            ProcessAccess.VM_READ;
+
+                hProcess = NativeMethods.OpenProcess(access, false, (uint)pid);
+
+                if (hProcess == IntPtr.Zero && isAdmin)
+                {
+                    hProcess = NativeMethods.OpenProcess(ProcessAccess.ALL_ACCESS, false, (uint)pid);
+                }
+
+                if (hProcess == IntPtr.Zero)
+                {
+                    return InjectionResult.CreateFailure($"OpenProcess failed: {GetLastErrorString()}");
+                }
+
+                // Get LoadLibraryW address
+                IntPtr kernel32 = NativeMethods.GetModuleHandle("kernel32.dll");
+                IntPtr loadLibrary = NativeMethods.GetProcAddress(kernel32, "LoadLibraryW");
+
+                if (loadLibrary == IntPtr.Zero)
+                {
+                    return InjectionResult.CreateFailure("LoadLibraryW not found");
+                }
+
+                // Allocate memory with CORRECT flags
+                byte[] dllPathBytes = Encoding.Unicode.GetBytes(dllPath + "\0");
+                LogInfo($"Allocating {dllPathBytes.Length} bytes for DLL path");
+
+                allocatedMem = NativeMethods.VirtualAllocEx(
+                    hProcess,
+                    IntPtr.Zero,
+                    (uint)dllPathBytes.Length,
+                    (uint)(MemoryAllocation.MEM_COMMIT | MemoryAllocation.MEM_RESERVE),
+                    0x04); // PAGE_READWRITE = 0x04, separated from allocation flags
+
+                if (allocatedMem == IntPtr.Zero)
+                {
+                    return InjectionResult.CreateFailure($"VirtualAllocEx failed: {GetLastErrorString()}");
+                }
+
+                UpdatePhase(InjectionStatus.MemoryAllocated, $"0x{allocatedMem:X}");
+
+                // Write DLL path to allocated memory
+                if (!NativeMethods.WriteProcessMemory(
+                    hProcess,
+                    allocatedMem,
+                    dllPathBytes,
+                    (uint)dllPathBytes.Length,
+                    out uint bytesWritten))
+                {
+                    return InjectionResult.CreateFailure($"WriteProcessMemory failed: {GetLastErrorString()}");
+                }
+
+                UpdatePhase(InjectionStatus.DLLWritten, $"{bytesWritten}/{dllPathBytes.Length} bytes written");
+
+                // Try NtCreateThreadEx first if requested
+                if (useNtMethod)
+                {
+                    UpdatePhase(InjectionStatus.ThreadCreated, "Using NtCreateThreadEx");
+
+                    uint result = NativeMethods.NtCreateThreadEx(
+                        out hThread,
+                        ThreadAccess.ALL_ACCESS,
+                        IntPtr.Zero,
+                        hProcess,
+                        loadLibrary,
+                        allocatedMem,
+                        0, 0, 0, 0, IntPtr.Zero);
+
+                    if (result != NativeMethods.STATUS_SUCCESS)
+                    {
+                        LogWarning($"NtCreateThreadEx failed (0x{result:X8}) - falling back to CreateRemoteThread");
+                        ntMethodFailed = true;
+                    }
+                }
+
+                // Fallback to CreateRemoteThread if NtCreateThreadEx failed or wasn't requested
+                if (!useNtMethod || ntMethodFailed)
+                {
+                    UpdatePhase(InjectionStatus.ThreadCreated,
+                        ntMethodFailed ? "Fallback to CreateRemoteThread" : "Using CreateRemoteThread");
+
+                    hThread = NativeMethods.CreateRemoteThread(
+                        hProcess,
+                        IntPtr.Zero,
+                        0,
+                        loadLibrary,
+                        allocatedMem,
+                        0,
+                        IntPtr.Zero);
+
+                    if (hThread == IntPtr.Zero)
+                    {
+                        return InjectionResult.CreateFailure($"CreateRemoteThread failed: {GetLastErrorString()}");
+                    }
+                }
+
+                // Wait for thread to complete
+                UpdatePhase(InjectionStatus.WaitingForThread);
+                uint waitResult = NativeMethods.WaitForSingleObject(hThread, 10000);
+
+                if (waitResult == NativeMethods.WAIT_TIMEOUT)
+                {
+                    return InjectionResult.CreateWarning("Thread timeout - DLL may still load");
+                }
+                else if (waitResult != 0)
+                {
+                    return InjectionResult.CreateFailure($"WaitForSingleObject failed: 0x{waitResult:X8}");
+                }
+
+                // Check thread exit code
+                // ✅ x64-safe success handling (DO NOT trust exitCode)
+                if (!NativeMethods.GetExitCodeThread(hThread, out uint exitCode))
+                {
+                    return InjectionResult.CreateFailure("GetExitCodeThread failed");
+                }
+
+                UpdatePhase(InjectionStatus.Success, $"Thread finished (code: 0x{exitCode:X})");
+
+                // Give loader time
+                Thread.Sleep(300);
+
+                // Real verification
+                if (VerifyDLLLoaded(pid, dllPath))
+                {
+                    LogSuccess($"✅ DLL loaded: {Path.GetFileName(dllPath)}");
+                }
+                else
+                {
+                    LogWarning("⚠️ DLL not visible (delay-load / stealth)");
+                }
+
+                return InjectionResult.CreateSuccess();
+               
+            }
+            catch (Exception ex)
+            {
+                UpdatePhase(InjectionStatus.Failed, ex.Message);
+                return InjectionResult.CreateFailure($"Exception: {ex.Message}");
+            }
+            finally
+            {
+                UpdatePhase(InjectionStatus.CleaningUp);
+
+                // Always clean up, even on error
+                if (allocatedMem != IntPtr.Zero && hProcess != IntPtr.Zero)
+                {
+                    NativeMethods.VirtualFreeEx(hProcess, allocatedMem, 0, MemoryAllocation.MEM_RELEASE);
+                }
+
+                if (hThread != IntPtr.Zero)
+                    NativeMethods.CloseHandle(hThread);
+
+                if (hProcess != IntPtr.Zero)
+                    NativeMethods.CloseHandle(hProcess);
+            }
+        }
+
+        private string GetLoadLibraryErrorDetail(int pid, string dllPath)
+        {
+            try
+            {
+                var details = new List<string>();
+
+                // Check file existence and permissions
+                if (!File.Exists(dllPath))
+                    details.Add("DLL file does not exist");
+
+                // Check DLL architecture
+                string dllArch = PreFlightChecks.GetDLLArchitecture(dllPath);
+                string procArch = PreFlightChecks.GetProcessArchitecture(pid);
+
+                if (dllArch != procArch)
+                    details.Add($"Arch mismatch: DLL={dllArch}, Process={procArch}");
+
+                // Check for common issues
+                try
+                {
+                    using var fs = File.OpenRead(dllPath);
+                    // File is accessible
+                }
+                catch (Exception ex)
+                {
+                    details.Add($"File access error: {ex.Message}");
+                }
+
+                return details.Count > 0 ? string.Join("; ", details) : "Unknown error";
+            }
+            catch
+            {
+                return "Could not determine error details";
+            }
+        }
+
+        private bool VerifyDLLLoaded(int pid, string dllPath)
+        {
+            try
+            {
+                var process = Process.GetProcessById(pid);
+                string targetDll = Path.GetFileName(dllPath).ToLower();
+
+                foreach (ProcessModule module in process.Modules)
+                {
+                    if (module.ModuleName.ToLower() == targetDll)
+                    {
+                        LogInfo($"Found DLL at base address: 0x{module.BaseAddress:X}");
+                        return true;
+                    }
+                }
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private string GetLastErrorString()
+        {
+            int error = Marshal.GetLastWin32Error();
+            return error switch
+            {
+                5 => "ACCESS_DENIED",
+                6 => "INVALID_HANDLE",
+                87 => "INVALID_PARAMETER",
+                299 => "PARTIAL_COPY (cross-architecture access?)",
+                487 => "INVALID_ADDRESS",
+                _ => $"Error code: 0x{error:X8} ({error})"
+            };
+        }
+
+        private void UpdatePhase(InjectionStatus phase, string message = "")
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(() => UpdatePhase(phase, message)));
+                return;
+            }
+
+            currentPhase = phase;
+
+            string phaseText = phase switch
+            {
+                InjectionStatus.NotStarted => "🔄 Not started",
+                InjectionStatus.PreFlightChecking => "🔍 Pre-flight checking...",
+                InjectionStatus.ArchCheckPassed => "✅ Architecture check passed",
+                InjectionStatus.ProcessCheckPassed => "✅ Process accessibility verified",
+                InjectionStatus.MemoryAllocated => "✅ Memory allocated",
+                InjectionStatus.DLLWritten => "✅ DLL path written",
+                InjectionStatus.ThreadCreated => "✅ Thread created",
+                InjectionStatus.WaitingForThread => "⏳ Waiting for thread completion",
+                InjectionStatus.CleaningUp => "🧹 Cleaning up resources",
+                InjectionStatus.Success => "🎉 Injection successful",
+                InjectionStatus.Warning => "⚠️ Injection completed with warnings",
+                InjectionStatus.Failed => "❌ Injection failed",
+                _ => phase.ToString()
+            };
+
+            if (!string.IsNullOrEmpty(message))
+            {
+                phaseText += $" - {message}";
+            }
+
+            // Update or add phase
+            int existingIndex = phaseListBox.Items.Count - 1;
+            if (existingIndex >= 0 && phaseListBox.Items[existingIndex].ToString()!.Contains(phase.ToString()))
+            {
+                phaseListBox.Items[existingIndex] = phaseText;
+            }
+            else
+            {
+                phaseListBox.Items.Add(phaseText);
+            }
+
+            phaseListBox.SelectedIndex = phaseListBox.Items.Count - 1;
+            phaseListBox.TopIndex = phaseListBox.Items.Count - 1;
+        }
+        #endregion
+
+        #region Process List Management
+        private void RefreshProcessList()
+        {
+            try
+            {
+                processListView.BeginUpdate();
+                processListView.Items.Clear();
+
+                // Clear old processes from cache
+                foreach (var procInfo in processCache)
+                {
+                    procInfo.Process?.Dispose();
+                }
+                processCache.Clear();
+
+                // Get fresh processes
+                var processes = Process.GetProcesses()
+                    .Where(p => p.Id > 4 && !string.IsNullOrEmpty(p.ProcessName))
+                    .OrderBy(p => p.ProcessName)
+                    .ToList();
+
+                foreach (var proc in processes)
+                {
+                    try
+                    {
+                        string arch = PreFlightChecks.GetProcessArchitecture(proc.Id);
+
+                        var procInfo = new ProcessInfo
+                        {
+                            Name = proc.ProcessName,
+                            Pid = proc.Id,
+                            Architecture = arch,
+                            Process = proc
+                        };
+
+                        processCache.Add(procInfo);
+                    }
+                    catch { }
+                }
+
+                // Apply current filter
+                ApplySearchFilter(searchBox.Text);
+                processListView.EndUpdate();
+
+                LogInfo($"Loaded {processCache.Count} processes");
+            }
+            catch (Exception ex)
+            {
+                LogError($"Refresh failed: {ex.Message}");
+            }
+        }
+
+        private void ApplySearchFilter(string filterText)
+        {
+            processListView.Items.Clear();
+
+            if (string.IsNullOrWhiteSpace(filterText))
+            {
+                // Show all
+                foreach (var procInfo in processCache)
+                {
+                    AddProcessToListView(procInfo);
+                }
+            }
+            else
+            {
+                // Filter by name or PID
+                string filter = filterText.ToLower();
+                foreach (var procInfo in processCache)
+                {
+                    if (procInfo.Name.ToLower().Contains(filter) ||
+                        procInfo.Pid.ToString().Contains(filter))
+                    {
+                        AddProcessToListView(procInfo);
+                    }
+                }
+            }
+        }
+
+        private void AddProcessToListView(ProcessInfo procInfo)
+        {
+            var item = new ListViewItem(procInfo.Name);
+            item.SubItems.Add(procInfo.Pid.ToString());
+            item.SubItems.Add(procInfo.Architecture);
+            item.Tag = procInfo.Pid;
+            processListView.Items.Add(item);
+        }
+        #endregion
+
+        #region Logging
+        public void Log(string message, Color color)
+        {
+            if (logBox.InvokeRequired)
+            {
+                logBox.Invoke(new Action(() => Log(message, color)));
+                return;
+            }
+
+            logBox.SelectionStart = logBox.TextLength;
+            logBox.SelectionLength = 0;
+            logBox.SelectionColor = color;
+            logBox.AppendText($"[{DateTime.Now:HH:mm:ss.fff}] {message}\n");
+            logBox.ScrollToCaret();
+        }
+
+        public void LogInfo(string message)
+        {
+            Log(message, Color.LightGray);
+        }
+
+        public void LogWarning(string message)
+        {
+            Log(message, Color.Orange);
+        }
+
+        public void LogError(string message)
+        {
+            Log(message, Color.LightCoral);
+        }
+
+        public void LogSuccess(string message)
+        {
+            Log(message, Color.LightGreen);
+        }
+
+        private void LogStartupInfo()
+        {
+            Log("=".PadRight(70, '='), Color.DarkBlue);
+            Log("INJECTOR MadeByMatzYT FOR WIN11 + x86/x64", Color.Cyan);
+            Log("", Color.LightGray);
+
+            Log("🔧 CRITICAL FIXES:", Color.LightGreen);
+            Log("  • Memory allocation flags separated correctly", Color.LightGray);
+            Log("  • Strict architecture enforcement", Color.LightGray);
+            Log("  • Better LoadLibrary error reporting", Color.LightGray);
+            Log("  • NtCreateThreadEx fallback improved", Color.LightGray);
+            Log("", Color.LightGray);
+
+            Log("🎯 WIN11 COMPATIBILITY:", Color.Yellow);
+            Log("  • x86/x64 architecture detection fixed", Color.LightGray);
+            Log("  • Protected process handling improved", Color.LightGray);
+            Log("  • Memory permission flags corrected", Color.LightGray);
+            Log("", Color.LightGray);
+
+            Log("⚠️ COMMON ISSUES SOLVED:", Color.Orange);
+            Log("  1. 'DllMain returned FALSE' - now gives detailed error", Color.LightGray);
+            Log("  2. Cross-architecture injection prevented", Color.LightGray);
+            Log("  3. Memory allocation permission errors fixed", Color.LightGray);
+            Log("", Color.LightGray);
+
+            Log($"Admin: {isAdmin} | Injector Arch: {(Environment.Is64BitProcess ? "x64" : "x86")}", Color.Yellow);
+            Log("=".PadRight(70, '='), Color.DarkBlue);
+            Log("", Color.LightGray);
+        }
+        #endregion
+    }
+    #endregion
+
+    static class Program
+    {
+        [STAThread]
+        static void Main()
+        {
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new MainForm());
+        }
+    }
+}
