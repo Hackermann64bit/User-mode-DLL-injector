@@ -616,7 +616,7 @@ namespace TechnicalInjector
 
         private void InitializeUI()
         {
-            Text = "Injector MadeByMatzYT For Win 32bit and 64bit ";
+            Text = "Injector MadeByHackerMann64bit For Win 32bit and 64bit ";
             MinimumSize = new Size(1000, 700);
             Size = new Size(1100, 800);
             StartPosition = FormStartPosition.CenterScreen;
@@ -1544,7 +1544,7 @@ namespace TechnicalInjector
         private void LogStartupInfo()
         {
             Log("=".PadRight(70, '='), Color.DarkBlue);
-            Log("INJECTOR MadeByMatzYT FOR WIN11 + x86/x64", Color.Cyan);
+            Log("INJECTOR MadeByHakcerMan64bit FOR WIN11 + x86/x64", Color.Cyan);
             Log("", Color.LightGray);
 
             Log("🔧 CRITICAL FIXES:", Color.LightGreen);
